@@ -25,3 +25,17 @@ def maybe_save_best_checkpoint(
 def should_stop_early(epoch, stale_epochs, start_epoch, patience):
     """Return whether early stopping should end training at this 1-based epoch."""
     return epoch > start_epoch and stale_epochs >= patience
+
+
+def should_evaluate_test(epoch, interval):
+    """Return whether this 1-based epoch is a scheduled test evaluation."""
+    if interval <= 0:
+        raise ValueError('test evaluation interval must be positive')
+    return epoch % interval == 0
+
+
+def meets_test_auc_target(current_auc, target_auc, max_relative_loss):
+    """Return whether test AUC is within the allowed relative loss of target AUC."""
+    if target_auc <= 0:
+        raise ValueError('target test AUC must be positive')
+    return current_auc >= target_auc * (1 - max_relative_loss)

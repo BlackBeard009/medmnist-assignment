@@ -3,7 +3,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from training_control import data_parallel_device_ids, maybe_save_best_checkpoint, should_stop_early
+from training_control import (
+    data_parallel_device_ids,
+    maybe_save_best_checkpoint,
+    meets_test_auc_target,
+    should_evaluate_test,
+    should_stop_early,
+)
 
 
 class TrainingControlTests(unittest.TestCase):
@@ -40,6 +46,15 @@ class TrainingControlTests(unittest.TestCase):
         self.assertEqual(data_parallel_device_ids([]), [])
         self.assertEqual(data_parallel_device_ids([0]), [])
         self.assertEqual(data_parallel_device_ids([0, 1]), [0, 1])
+
+    def test_runs_test_evaluation_on_each_tenth_epoch(self):
+        self.assertFalse(should_evaluate_test(epoch=9, interval=10))
+        self.assertTrue(should_evaluate_test(epoch=10, interval=10))
+        self.assertTrue(should_evaluate_test(epoch=20, interval=10))
+
+    def test_accepts_test_auc_within_one_percent_relative_loss(self):
+        self.assertTrue(meets_test_auc_target(current_auc=0.773 * 0.99, target_auc=0.773, max_relative_loss=0.01))
+        self.assertFalse(meets_test_auc_target(current_auc=0.773 * 0.9899, target_auc=0.773, max_relative_loss=0.01))
 
 
 if __name__ == "__main__":

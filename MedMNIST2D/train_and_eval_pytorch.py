@@ -14,12 +14,18 @@ import torchvision.transforms as transforms
 from medmnist import INFO, Evaluator
 from models import ResNet18, ResNet50
 from tensorboardX import SummaryWriter
-from training_control import data_parallel_device_ids, maybe_save_best_checkpoint, should_stop_early
+from training_control import (
+    data_parallel_device_ids,
+    maybe_save_best_checkpoint,
+    meets_test_auc_target,
+    should_evaluate_test,
+    should_stop_early,
+)
 from torchvision.models import resnet18, resnet50
 from tqdm import trange
 
 
-def main(data_flag, output_root, num_epochs, gpu_ids, batch_size, size, download, model_flag, resize, as_rgb, model_path, run, early_stop_patience, early_stop_start_epoch):
+def main(data_flag, output_root, num_epochs, gpu_ids, batch_size, size, download, model_flag, resize, as_rgb, model_path, run, early_stop_patience, early_stop_start_epoch, test_eval_interval, target_test_auc, max_relative_test_auc_loss):
 
     lr = 0.001
     gamma=0.1
@@ -133,6 +139,7 @@ def main(data_flag, output_root, num_epochs, gpu_ids, batch_size, size, download
     best_epoch = None
     stale_epochs = 0
     path = os.path.join(output_root, 'best_model.pth')
+    target_path = os.path.join(output_root, 'target_model.pth')
 
     global iteration
     iteration = 0
@@ -164,20 +171,38 @@ def main(data_flag, output_root, num_epochs, gpu_ids, batch_size, size, download
             print('cur_best_auc:', best_auc)
             print('cur_best_epoch', best_epoch)
 
-        test_metrics = test(model, test_evaluator, test_loader, task, criterion, device, run)
-        
+        test_metrics = None
+        if should_evaluate_test(epoch + 1, test_eval_interval):
+            test_metrics = test(model, test_evaluator, test_loader, task, criterion, device, run)
+            print('epoch %d test auc: %.5f  acc: %.5f' % (epoch + 1, test_metrics[1], test_metrics[2]))
+
+            if target_test_auc is not None and meets_test_auc_target(test_metrics[1], target_test_auc, max_relative_test_auc_loss):
+                target_checkpoint = dict(checkpoint, test_auc=test_metrics[1])
+                torch.save(target_checkpoint, target_path)
+                print('Target test AUC reached at epoch %d: %.5f (target %.5f, relative loss %.2f%%).' % (
+                    epoch + 1,
+                    test_metrics[1],
+                    target_test_auc,
+                    (target_test_auc - test_metrics[1]) / target_test_auc * 100,
+                ))
+                break
+
         scheduler.step()
         
         for i, key in enumerate(train_logs):
             log_dict[key] = train_metrics[i]
         for i, key in enumerate(val_logs):
             log_dict[key] = val_metrics[i]
-        for i, key in enumerate(test_logs):
-            log_dict[key] = test_metrics[i]
+        if test_metrics is not None:
+            for i, key in enumerate(test_logs):
+                log_dict[key] = test_metrics[i]
 
-        for key, value in log_dict.items():
-            writer.add_scalar(key, value, epoch)
-            
+        for key in train_logs + val_logs:
+            writer.add_scalar(key, log_dict[key], epoch)
+        if test_metrics is not None:
+            for key in test_logs:
+                writer.add_scalar(key, log_dict[key], epoch)
+
         if not improved and epoch + 1 > early_stop_start_epoch:
             stale_epochs += 1
 
@@ -320,6 +345,18 @@ if __name__ == '__main__':
                         default=75,
                         help='first 1-based epoch at which early stopping can begin',
                         type=int)
+    parser.add_argument('--test_eval_interval',
+                        default=10,
+                        help='evaluate the test set every N epochs',
+                        type=int)
+    parser.add_argument('--target_test_auc',
+                        default=None,
+                        help='stop when test AUC is within the allowed relative loss of this target',
+                        type=float)
+    parser.add_argument('--max_relative_test_auc_loss',
+                        default=0.01,
+                        help='maximum relative loss from target test AUC, as a decimal fraction',
+                        type=float)
 
 
     args = parser.parse_args()
@@ -337,5 +374,8 @@ if __name__ == '__main__':
     run = args.run
     early_stop_patience = args.early_stop_patience
     early_stop_start_epoch = args.early_stop_start_epoch
+    test_eval_interval = args.test_eval_interval
+    target_test_auc = args.target_test_auc
+    max_relative_test_auc_loss = args.max_relative_test_auc_loss
 
-    main(data_flag, output_root, num_epochs, gpu_ids, batch_size, size, download, model_flag, resize, as_rgb, model_path, run, early_stop_patience, early_stop_start_epoch)
+    main(data_flag, output_root, num_epochs, gpu_ids, batch_size, size, download, model_flag, resize, as_rgb, model_path, run, early_stop_patience, early_stop_start_epoch, test_eval_interval, target_test_auc, max_relative_test_auc_loss)
