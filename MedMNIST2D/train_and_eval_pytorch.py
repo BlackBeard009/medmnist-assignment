@@ -2,7 +2,6 @@ import argparse
 import os
 import time
 from collections import OrderedDict
-from copy import deepcopy
 
 import medmnist
 import numpy as np
@@ -15,11 +14,12 @@ import torchvision.transforms as transforms
 from medmnist import INFO, Evaluator
 from models import ResNet18, ResNet50
 from tensorboardX import SummaryWriter
+from training_control import data_parallel_device_ids, maybe_save_best_checkpoint, should_stop_early
 from torchvision.models import resnet18, resnet50
 from tqdm import trange
 
 
-def main(data_flag, output_root, num_epochs, gpu_ids, batch_size, size, download, model_flag, resize, as_rgb, model_path, run):
+def main(data_flag, output_root, num_epochs, gpu_ids, batch_size, size, download, model_flag, resize, as_rgb, model_path, run, early_stop_patience, early_stop_start_epoch):
 
     lr = 0.001
     gamma=0.1
@@ -39,9 +39,10 @@ def main(data_flag, output_root, num_epochs, gpu_ids, batch_size, size, download
         if id >= 0:
             gpu_ids.append(id)
     if len(gpu_ids) > 0:
-        os.environ["CUDA_VISIBLE_DEVICES"]=str(gpu_ids[0])
+        os.environ["CUDA_VISIBLE_DEVICES"] = ','.join(map(str, gpu_ids))
 
-    device = torch.device('cuda:{}'.format(gpu_ids[0])) if gpu_ids else torch.device('cpu') 
+    device = torch.device('cuda:0') if gpu_ids else torch.device('cpu')
+    parallel_device_ids = data_parallel_device_ids(list(range(len(gpu_ids))))
     
     output_root = os.path.join(output_root, data_flag, time.strftime("%y%m%d_%H%M%S"))
     if not os.path.exists(output_root):
@@ -100,6 +101,12 @@ def main(data_flag, output_root, num_epochs, gpu_ids, batch_size, size, download
 
     if model_path is not None:
         model.load_state_dict(torch.load(model_path, map_location=device)['net'], strict=True)
+
+    if parallel_device_ids:
+        print('==> Using DataParallel on %d GPUs.' % len(parallel_device_ids))
+        model = nn.DataParallel(model, device_ids=parallel_device_ids)
+
+    if model_path is not None:
         train_metrics = test(model, train_evaluator, train_loader_at_eval, task, criterion, device, run, output_root)
         val_metrics = test(model, val_evaluator, val_loader, task, criterion, device, run, output_root)
         test_metrics = test(model, test_evaluator, test_loader, task, criterion, device, run, output_root)
@@ -122,18 +129,41 @@ def main(data_flag, output_root, num_epochs, gpu_ids, batch_size, size, download
     
     writer = SummaryWriter(log_dir=os.path.join(output_root, 'Tensorboard_Results'))
 
-    best_auc = 0
-    best_epoch = 0
-    best_model = deepcopy(model)
+    best_auc = float('-inf')
+    best_epoch = None
+    stale_epochs = 0
+    path = os.path.join(output_root, 'best_model.pth')
 
     global iteration
     iteration = 0
     
     for epoch in trange(num_epochs):        
         train_loss = train(model, train_loader, task, criterion, optimizer, device, writer)
-        
+
         train_metrics = test(model, train_evaluator, train_loader_at_eval, task, criterion, device, run)
         val_metrics = test(model, val_evaluator, val_loader, task, criterion, device, run)
+        cur_auc = val_metrics[1]
+        model_to_checkpoint = model.module if isinstance(model, nn.DataParallel) else model
+        checkpoint = {
+            'net': model_to_checkpoint.state_dict(),
+            'epoch': epoch + 1,
+            'val_auc': cur_auc,
+            'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
+        }
+        best_auc, stale_epochs, improved = maybe_save_best_checkpoint(
+            cur_auc,
+            best_auc,
+            stale_epochs,
+            checkpoint,
+            path,
+            torch.save,
+        )
+        if improved:
+            best_epoch = epoch + 1
+            print('cur_best_auc:', best_auc)
+            print('cur_best_epoch', best_epoch)
+
         test_metrics = test(model, test_evaluator, test_loader, task, criterion, device, run)
         
         scheduler.step()
@@ -148,24 +178,20 @@ def main(data_flag, output_root, num_epochs, gpu_ids, batch_size, size, download
         for key, value in log_dict.items():
             writer.add_scalar(key, value, epoch)
             
-        cur_auc = val_metrics[1]
-        if cur_auc > best_auc:
-            best_epoch = epoch
-            best_auc = cur_auc
-            best_model = deepcopy(model)
-            print('cur_best_auc:', best_auc)
-            print('cur_best_epoch', best_epoch)
+        if not improved and epoch + 1 > early_stop_start_epoch:
+            stale_epochs += 1
 
-    state = {
-        'net': best_model.state_dict(),
-    }
+        if should_stop_early(epoch + 1, stale_epochs, early_stop_start_epoch, early_stop_patience):
+            print('Early stopping at epoch %d after %d non-improving epochs.' % (epoch + 1, stale_epochs))
+            break
 
-    path = os.path.join(output_root, 'best_model.pth')
-    torch.save(state, path)
+    checkpoint = torch.load(path, map_location=device)
+    model_to_evaluate = model.module if isinstance(model, nn.DataParallel) else model
+    model_to_evaluate.load_state_dict(checkpoint['net'], strict=True)
 
-    train_metrics = test(best_model, train_evaluator, train_loader_at_eval, task, criterion, device, run, output_root)
-    val_metrics = test(best_model, val_evaluator, val_loader, task, criterion, device, run, output_root)
-    test_metrics = test(best_model, test_evaluator, test_loader, task, criterion, device, run, output_root)
+    train_metrics = test(model, train_evaluator, train_loader_at_eval, task, criterion, device, run, output_root)
+    val_metrics = test(model, val_evaluator, val_loader, task, criterion, device, run, output_root)
+    test_metrics = test(model, test_evaluator, test_loader, task, criterion, device, run, output_root)
 
     train_log = 'train  auc: %.5f  acc: %.5f\n' % (train_metrics[1], train_metrics[2])
     val_log = 'val  auc: %.5f  acc: %.5f\n' % (val_metrics[1], val_metrics[2])
@@ -286,6 +312,14 @@ if __name__ == '__main__':
                         default='model1',
                         help='to name a standard evaluation csv file, named as {flag}_{split}_[AUC]{auc:.3f}_[ACC]{acc:.3f}@{run}.csv',
                         type=str)
+    parser.add_argument('--early_stop_patience',
+                        default=5,
+                        help='number of consecutive non-improving validation-AUC epochs before stopping',
+                        type=int)
+    parser.add_argument('--early_stop_start_epoch',
+                        default=75,
+                        help='first 1-based epoch at which early stopping can begin',
+                        type=int)
 
 
     args = parser.parse_args()
@@ -301,5 +335,7 @@ if __name__ == '__main__':
     as_rgb = args.as_rgb
     model_path = args.model_path
     run = args.run
-    
-    main(data_flag, output_root, num_epochs, gpu_ids, batch_size, size, download, model_flag, resize, as_rgb, model_path, run)
+    early_stop_patience = args.early_stop_patience
+    early_stop_start_epoch = args.early_stop_start_epoch
+
+    main(data_flag, output_root, num_epochs, gpu_ids, batch_size, size, download, model_flag, resize, as_rgb, model_path, run, early_stop_patience, early_stop_start_epoch)
