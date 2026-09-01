@@ -5,6 +5,7 @@ from pathlib import Path
 
 from training_control import (
     data_parallel_device_ids,
+    load_trusted_checkpoint,
     maybe_save_best_checkpoint,
     meets_test_auc_target,
     should_evaluate_test,
@@ -13,6 +14,19 @@ from training_control import (
 
 
 class TrainingControlTests(unittest.TestCase):
+    def test_loads_our_checkpoint_containing_numpy_metadata(self):
+        """Prevents PyTorch 2.6's safe-only default from rejecting our checkpoint."""
+        calls = []
+
+        def load_checkpoint(path, **kwargs):
+            calls.append((path, kwargs))
+            return {"net": {}, "val_auc": 0.7662}
+
+        checkpoint = load_trusted_checkpoint(load_checkpoint, "checkpoint.pth", "cpu")
+
+        self.assertEqual(checkpoint, {"net": {}, "val_auc": 0.7662})
+        self.assertEqual(calls, [("checkpoint.pth", {"map_location": "cpu", "weights_only": False})])
+
     def test_new_best_score_persists_checkpoint_and_resets_counter(self):
         def write_json(payload, destination):
             Path(destination).write_text(json.dumps(payload), encoding="utf-8")

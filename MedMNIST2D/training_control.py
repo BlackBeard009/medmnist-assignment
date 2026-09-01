@@ -6,6 +6,11 @@ def data_parallel_device_ids(gpu_ids):
     return list(gpu_ids) if len(gpu_ids) > 1 else []
 
 
+def load_trusted_checkpoint(load_checkpoint, checkpoint_path, device):
+    """Load a checkpoint saved by this training script, including optimizer metadata."""
+    return load_checkpoint(checkpoint_path, map_location=device, weights_only=False)
+
+
 def maybe_save_best_checkpoint(
     validation_auc,
     best_auc,

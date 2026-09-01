@@ -16,6 +16,7 @@ from models import ResNet18, ResNet50
 from tensorboardX import SummaryWriter
 from training_control import (
     data_parallel_device_ids,
+    load_trusted_checkpoint,
     maybe_save_best_checkpoint,
     meets_test_auc_target,
     should_evaluate_test,
@@ -106,7 +107,7 @@ def main(data_flag, output_root, num_epochs, gpu_ids, batch_size, size, download
         criterion = nn.CrossEntropyLoss()
 
     if model_path is not None:
-        model.load_state_dict(torch.load(model_path, map_location=device)['net'], strict=True)
+        model.load_state_dict(load_trusted_checkpoint(torch.load, model_path, device)['net'], strict=True)
 
     if parallel_device_ids:
         print('==> Using DataParallel on %d GPUs.' % len(parallel_device_ids))
@@ -210,7 +211,7 @@ def main(data_flag, output_root, num_epochs, gpu_ids, batch_size, size, download
             print('Early stopping at epoch %d after %d non-improving epochs.' % (epoch + 1, stale_epochs))
             break
 
-    checkpoint = torch.load(path, map_location=device)
+    checkpoint = load_trusted_checkpoint(torch.load, path, device)
     model_to_evaluate = model.module if isinstance(model, nn.DataParallel) else model
     model_to_evaluate.load_state_dict(checkpoint['net'], strict=True)
 
